@@ -61,7 +61,7 @@ flowchart LR
 Clone this repository and navigate into the lab directory:
 
 ```bash
-git clone https://github.com/<YOUR_GITHUB_USERNAME>/ai-infra-lab.git
+git clone https://github.com/sampriyadarshi/ai-infra-lab.git
 cd ai-infra-lab
 ```
 
