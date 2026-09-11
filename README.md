@@ -57,7 +57,15 @@ flowchart LR
 * A Google Cloud Project with billing enabled and quota for at least **1x NVIDIA L4 GPU** (`NVIDIA_L4_GPUS`) in your target region (e.g., `us-central1`).
 * `gcloud`, `kubectl`, and `python3` (`pip install aiohttp requests`) installed (all pre-installed in **Google Cloud Shell**).
 
-### Step 1: Set Environment Variables & Enable APIs
+### Step 1: Clone the Repository
+Clone this repository and navigate into the lab directory:
+
+```bash
+git clone https://github.com/<YOUR_GITHUB_USERNAME>/ai-infra-lab.git
+cd ai-infra-lab
+```
+
+### Step 2: Set Environment Variables & Enable APIs
 Set your project variables once so all subsequent commands work seamlessly:
 
 ```bash
@@ -72,7 +80,7 @@ gcloud config set project $PROJECT_ID
 gcloud services enable compute.googleapis.com container.googleapis.com
 ```
 
-### Step 2: Create a Base GKE Cluster
+### Step 3: Create a Base GKE Cluster
 Create a standard regional/zonal GKE cluster with a lightweight CPU default node pool for system components:
 
 ```bash
@@ -88,7 +96,7 @@ gcloud container clusters get-credentials $CLUSTER_NAME \
   --project=$PROJECT_ID
 ```
 
-### Step 3: Add a Spot NVIDIA L4 GPU Node Pool (with Autoscaling 0 → 2 Nodes)
+### Step 4: Add a Spot NVIDIA L4 GPU Node Pool (with Autoscaling 0 → 2 Nodes)
 We attach a dedicated GPU node pool using `g2-standard-4` (4 vCPUs, 16 GiB RAM, **1x NVIDIA L4 24 GiB GPU**).
 * Using `--spot` saves ~60–70% on GPU compute costs.
 * Using `--enable-autoscaling --min-nodes=0` ensures the GPU node pool automatically scales down to **0 nodes ($0/hr)** whenever your vLLM pod is deleted.
@@ -108,7 +116,7 @@ gcloud container node-pools create gpu-l4-pool \
   --max-nodes=2
 ```
 
-### Step 4: Verify GPU Allocatable Status in Kubernetes
+### Step 5: Verify GPU Allocatable Status in Kubernetes
 Wait ~2–3 minutes after node creation for the background NVIDIA driver installation to complete, then check that `1` GPU is allocatable:
 
 ```bash
@@ -122,7 +130,7 @@ gke-ai-infra-lab-cluster-default-pool-...             <none>
 gke-ai-infra-lab-cluster-gpu-l4-pool-...              1
 ```
 
-### Step 5: Deploy vLLM (`Qwen/Qwen2.5-3B-Instruct`)
+### Step 6: Deploy vLLM (`Qwen/Qwen2.5-3B-Instruct`)
 Deploy the vLLM server and wait for the pod to download the model weights and initialize the GPU KV cache (~2 minutes):
 
 ```bash
@@ -130,7 +138,7 @@ kubectl apply -f vllm-deployment.yaml
 kubectl get pods -l app=vllm-qwen -w
 ```
 
-### Step 6: Port-Forward & Run Lab 1 Benchmarks
+### Step 7: Port-Forward & Run Lab 1 Benchmarks
 In **Terminal Tab 1**, forward port `8000`:
 ```bash
 kubectl port-forward svc/vllm-qwen-service 8000:8000
