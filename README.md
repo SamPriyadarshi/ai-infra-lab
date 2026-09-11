@@ -2,7 +2,7 @@
 
 A hands-on engineering repository for learning and benchmarking foundational and production **AI Infrastructure** concepts on **Google Kubernetes Engine (GKE)** using **NVIDIA L4 GPUs (24 GB VRAM)** and **vLLM**.
 
-This guide is designed so **anyone** can clone the repository, spin up a reproducible GPU-accelerated Kubernetes environment on Google Cloud from scratch, run real-world LLM serving benchmarks, and tear down all resources when done.
+This guide is designed so **anyone** can clone the repository, spin up a reproducible GPU-accelerated Kubernetes environment on Google Cloud from scratch, run real-world LLM serving benchmarks, interact with the model via its OpenAI/OpenAPI-compatible endpoints, and tear down all resources when done.
 
 ---
 
@@ -152,68 +152,93 @@ python3 02_multi_user_load_test.py
 
 ---
 
-## Part 3: Real-World Kubernetes & AI Infra Troubleshooting Q&A
+## Part 3: Deep Dive into vLLM Configuration Arguments
 
-Below are detailed explanations for real-world engineering issues encountered while setting up and running Lab 1.
+Below is the breakdown of every CLI flag configured in [`vllm-deployment.yaml`](./vllm-deployment.yaml) and how each controls GPU memory and batch scheduling:
 
-### Q1: Why did `gcloud container node-pools create` print a warning note about NVIDIA GPU drivers, and do I need to manually apply the DaemonSet?
-* **Answer**: On **GKE 1.30+**, GKE automatically installs the default NVIDIA GPU driver in the background. However, if you omit `gpu-driver-version=default` inside the `--accelerator` flag, the `gcloud` CLI prints a generic reminder note.
-* **How to check**: Run `kubectl get pods -n kube-system | grep nvidia`. If you see `nvidia-driver-installer-...`, GKE is already installing the driver automatically! Only apply the manual DaemonSet (`kubectl apply -f https://raw.githubusercontent.com/GoogleCloudPlatform/container-engine-accelerators/master/nvidia-driver-installer/cos/daemonset-preloaded-latest.yaml`) if no installer pod appears after node creation.
-
----
-
-### Q2: Why did `status.allocatable["nvidia.com/gpu"]` show `<none>` right after the node booted, and what does the value `1` represent?
-* **Why it showed `<none>`**: After a GPU VM boots, it takes **2–3 minutes** for the `nvidia-driver-installer` pod to download kernel headers, compile/load the NVIDIA kernel modules, and register the device with `kubelet`.
-* **What `1` represents**: It means Kubernetes has registered **1 physical NVIDIA L4 GPU (24 GB VRAM)** as an indivisible integer resource unit (`nvidia.com/gpu: "1"`).
-  * Unlike CPU (`500m`) or RAM (`4Gi`), standard Kubernetes cannot split a GPU fractionally. When our vLLM pod requests `nvidia.com/gpu: "1"`, it receives **exclusive access to all 24 GB of VRAM**, preventing any other container from interfering with vLLM's PagedAttention KV cache pool.
+* **`--model=Qwen/Qwen2.5-3B-Instruct`**: Downloads and loads the 3-Billion parameter instruction-tuned Qwen 2.5 model in 16-bit (`BF16`), consuming **~6.2 GB of VRAM** for static weights.
+* **`--port=8000`**: Binds the FastAPI HTTP server to port `8000`, exposing OpenAI-compatible inference routes alongside a Prometheus `/metrics` endpoint.
+* **`--gpu-memory-utilization=0.85`**: Reserves **85% of the L4's 24 GB VRAM (20.4 GB)** for vLLM. After loading weights (~6.2 GB) and CUDA workspace (~1.5 GB), the remaining **~12.7 GB is pre-allocated into 16-token PagedAttention KV cache blocks**. The remaining 15% (~3.6 GB) acts as safety headroom against CUDA Out-Of-Memory (OOM) crashes.
+* **`--max-model-len=4096`**: Caps the maximum context length (prompt + completion) per request at 4,096 tokens (down from Qwen's native 32,768 limit) so no single request can monopolize the KV cache pool.
+* **`--max-num-seqs=64`**: Caps active **Continuous Batching** concurrency at 64 simultaneous sequences per forward pass to protect per-token latency (ITL). Any requests beyond #64 wait safely in the queue (`vllm:num_requests_waiting`).
+* **`--enable-prefix-caching`**: Turns on **Automatic Prefix Caching (APC)**. vLLM hashes every 16-token KV cache block; requests sharing a common system prompt reuse existing KV blocks in VRAM and skip Prefill computation entirely.
 
 ---
 
-### Q3: Why did the GPU node scale down to 0 (`1 node(s) were unschedulable`) and fail to scale back up when the pod requested `cpu: "4"` and `memory: "16Gi"` on `g2-standard-4`?
-* **Why it scaled down**: Because `--enable-autoscaling --min-nodes=0` was set, GKE's Cluster Autoscaler cordoned (`SchedulingDisabled` / `unschedulable`) and terminated the idle GPU node after ~10 minutes to save GPU costs.
-* **Why `cpu: "4"` and `memory: "16Gi"` blocked scale-up**:
-  * A `g2-standard-4` VM has **4 vCPUs and 16 GiB RAM total (`Capacity`)**.
-  * However, GKE reserves ~0.1 vCPU and ~2.5 GiB RAM for the OS, `kubelet`, and `kube-system` DaemonSets (including the NVIDIA driver pods). This leaves **~3.8 vCPUs and ~13.4 GiB RAM as actual `Allocatable` capacity**.
-  * When the pod requested `memory: "16Gi"`, the Cluster Autoscaler simulated spinning up a `g2-standard-4`, saw that `16Gi > 13.4Gi`, and refused to scale up because the pod would never fit!
-* **The Fix**: In [`vllm-deployment.yaml`](./vllm-deployment.yaml), setting `requests: {cpu: "2", memory: "10Gi"}` and `limits: {cpu: "2", memory: "12Gi"}` fits comfortably inside `g2-standard-4`'s allocatable budget while still giving the container 100% of the L4 GPU (`nvidia.com/gpu: "1"`).
+## Part 4: OpenAI / OpenAPI Compatibility & Interactive Usage (`/v1/chat/completions`)
+
+### Why OpenAPI & OpenAI Compatibility Matters in Production
+The `vllm.entrypoints.openai.api_server` module is built on **FastAPI** and implements the full **OpenAPI 3.0 specification** alongside the official **OpenAI REST API schema**. This gives you two major advantages in production AI Infrastructure:
+
+1. **Zero-Code-Change Drop-In Replacement**: Any application, microservice, or framework (such as the official `openai` Python/TypeScript SDKs, LangChain, LlamaIndex, or Open WebUI) can switch from OpenAI's cloud API to your self-hosted GKE vLLM cluster simply by changing the base URL (`http://localhost:8000/v1`).
+2. **Self-Documenting OpenAPI Schema**: You can inspect the interactive Swagger UI or download the full OpenAPI JSON schema directly from your running server:
+   * **Interactive Swagger Docs**: `http://localhost:8000/docs`
+   * **OpenAPI Specification**: `http://localhost:8000/openapi.json`
+   * **Loaded Models List**: `http://localhost:8000/v1/models`
+
+### 1. Sending Chat Prompts via `curl` (`/v1/chat/completions`)
+With `kubectl port-forward svc/vllm-qwen-service 8000:8000` active, send an interactive multi-turn or creative prompt to `/v1/chat/completions`:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen2.5-3B-Instruct",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a senior AI Infrastructure Architect explaining concepts clearly."
+      },
+      {
+        "role": "user",
+        "content": "Explain why PagedAttention prevents GPU memory fragmentation in 3 bullet points."
+      }
+    ],
+    "temperature": 0.7,
+    "max_tokens": 200
+  }' | jq -r '.choices[0].message.content'
+```
+
+### 2. Sending Raw Text Prompts via `curl` (`/v1/completions`)
+For non-chat text completion tasks, query `/v1/completions`:
+
+```bash
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen2.5-3B-Instruct",
+    "prompt": "The three most important metrics for LLM serving are:",
+    "max_tokens": 100,
+    "temperature": 0.3
+  }' | jq -r '.choices[0].text'
+```
+
+### 3. Using the Official OpenAI Python SDK with Your GKE vLLM Server
+Because vLLM is 100% OpenAI API-compatible, you can use the standard `openai` Python library (`pip install openai`):
+
+```python
+from openai import OpenAI
+
+# Point the official OpenAI client to your local/GKE vLLM endpoint
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="not-needed-for-local-vllm",
+)
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen2.5-3B-Instruct",
+    messages=[
+        {"role": "user", "content": "Write a haiku about GPUs and Kubernetes."}
+    ],
+    temperature=0.7,
+)
+
+print(response.choices[0].message.content)
+```
 
 ---
 
-### Q4: What does each vLLM CLI flag in `vllm-deployment.yaml` do?
-* `--model=Qwen/Qwen2.5-3B-Instruct`: Downloads the 3B parameter BF16 model (~6.2 GB VRAM).
-* `--port=8000`: Exposes the OpenAI-compatible HTTP server (`/v1/completions`, `/v1/chat/completions`) and Prometheus `/metrics` endpoint on port 8000.
-* `--gpu-memory-utilization=0.85`: Reserves 85% of the L4's 24 GB VRAM (**20.4 GB**) for vLLM. After loading weights (~6.2 GB) and workspace (~1.5 GB), the remaining **~12.7 GB is pre-allocated into 16-token PagedAttention KV cache blocks**. The remaining 15% (~3.6 GB) acts as safety headroom against CUDA Out-Of-Memory (OOM) errors.
-* `--max-model-len=4096`: Caps maximum context length per request at 4,096 tokens (down from Qwen's native 32k) so no single request can monopolize the KV cache.
-* `--max-num-seqs=64`: Caps active Continuous Batching concurrency at 64 simultaneous sequences per forward pass to protect per-token latency (ITL).
-* `--enable-prefix-caching`: Turns on **Automatic Prefix Caching (APC)**. vLLM hashes every 16-token KV cache block; requests sharing a common system prompt reuse existing KV blocks in VRAM and skip Prefill computation.
-
----
-
-### Q5: Why did Cloud Shell Web Preview show `Couldn't connect to a server on port 8080` and then `{"detail": "Not Found"}`?
-* **Port `8080` vs `8000`**: Google Cloud Shell's "Web Preview" defaults to port `8080`, whereas `kubectl port-forward svc/vllm-qwen-service 8000:8000` forwards port `8000`. Changing Web Preview to port `8000` (or forwarding `8080:8000`) resolves the connection error.
-* **Why `/` returns `{"detail": "Not Found"}`**: This JSON response comes directly from FastAPI inside vLLM! Because vLLM is a headless API server (not an HTML website), the root URL `/` has no route. Appending `/v1/models`, `/health`, or `/metrics` displays the live server data.
-
----
-
-### Q6: Why did `kubectl logs -l app=vllm-qwen | grep -E "KV cache|blocks|memory"` return no output?
-* **Subtle `kubectl` behavior**: When you query logs using a **label selector (`-l app=vllm-qwen`)**, `kubectl` automatically defaults to **`--tail=10`** (printing only the last 10 lines of logs!).
-* Because vLLM continuously logs periodic `/health` checks, the startup lines where vLLM printed the KV cache block counts scrolled past the last 10 lines.
-* **The Fix**: Add **`--tail=-1`** to search the entire log history from container startup:
-  ```bash
-  kubectl logs -l app=vllm-qwen --tail=-1 | grep -iE "cache|block|memory|gpu"
-  ```
-
----
-
-### Q7: Can I use `Qwen/Qwen2.5-3B-Instruct` for daily tasks (creative writing, general purpose), and how should I size larger models for an NVIDIA L4 (24 GB VRAM)?
-* **Using the 3B model**: Yes! It is very fast (~100+ tok/s) and works well for drafting, summarization, rewriting, and basic coding via `/v1/chat/completions`.
-* **Upgrading model quality on 1x NVIDIA L4 (24 GB VRAM)**:
-  * **Unquantized (`BF16`) Upgrade**: **`Qwen/Qwen2.5-7B-Instruct`** or **`meta-llama/Llama-3.1-8B-Instruct`** (~15.5 GB weights $\rightarrow$ ~5 GB remaining for KV cache). Great quality boost for 1–8 concurrent users.
-  * **Quantized (`4-bit AWQ`) Production Upgrade**: **`Qwen/Qwen2.5-14B-Instruct-AWQ`** (~8.5 GB weights $\rightarrow$ ~11 GB remaining for KV cache). Fits a 14-Billion parameter model on a single L4 GPU with near GPT-4o-mini quality and high multi-user concurrency!
-
----
-
-## Part 4: Cost Control & Cleanup
+## Part 5: Cost Control & Cleanup
 To avoid incurring ongoing GPU or cluster charges when you pause your experiments:
 
 ```bash
